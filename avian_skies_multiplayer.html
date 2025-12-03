@@ -155,7 +155,8 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, collection, doc, setDoc, onSnapshot, updateDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        // NOTE: deleteDoc is imported here for cleanup on page close
+        import { getFirestore, collection, doc, setDoc, onSnapshot, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // --- BIRD STATS CONFIG ---
         const BIRD_TYPES = {
@@ -396,7 +397,7 @@
                         name: this.playerName,
                         score: this.score,
                         lastSeen: now
-                    }).catch(err => {});
+                    }).catch(err => { /* Error handled silently to prevent logging storm */ });
                 }
             }
         }
@@ -432,7 +433,7 @@
         // --- SETUP ---
 
         async function initApp() {
-            // 1. Firebase
+            // 1. Firebase Auth
             try {
                 app = initializeApp(firebaseConfig);
                 auth = getAuth(app);
@@ -449,7 +450,9 @@
                     if (user) {
                         document.getElementById('loading').innerText = "Ready to fly.";
                         document.getElementById('start-btn').disabled = false;
-                        setupSnapshotListeners();
+                        
+                        // Set up cleanup ONLY after we have a UID to reference
+                        window.addEventListener('beforeunload', cleanupOnDisconnect);
                     }
                 });
             } catch (e) {
@@ -461,6 +464,14 @@
             
             // 2. Button Listeners
             document.getElementById('start-btn').addEventListener('click', startGame);
+        }
+
+        // Cleanup: Ensures player document is deleted when browser tab is closed/refreshed
+        function cleanupOnDisconnect() {
+            if (playerRef) {
+                // Delete the player's document from the database
+                deleteDoc(playerRef).catch(e => console.log("Failed to clean up player document:", e));
+            }
         }
 
         function startGame() {
@@ -483,9 +494,11 @@
                 }
             });
 
-            // Initialize World if not already
+            // Initialize World and Game Player if not already done
             if (!scene) {
                 initThreeJS(birdType, nameInput);
+                // CRITICAL FIX: Setup Firestore listeners only AFTER the Three.js scene is ready
+                setupSnapshotListeners();
             }
         }
 
@@ -497,6 +510,7 @@
             onSnapshot(playersRef, (snapshot) => {
                 const now = Date.now();
                 const lbData = [];
+                const activeIds = new Set(); // Track IDs seen in this snapshot
 
                 // Add self to leaderboard data if playing
                 if (player) {
@@ -506,7 +520,11 @@
                 snapshot.forEach(doc => {
                     const data = doc.data();
                     if (doc.id === user.uid) return;
-                    if (now - data.lastSeen > 10000) return; // Stale
+                    
+                    // Filter out stale players (> 10 seconds old)
+                    if (now - data.lastSeen > 10000) return; 
+
+                    activeIds.add(doc.id);
 
                     // Update 3D World
                     if (!onlinePlayers[doc.id]) {
@@ -517,6 +535,14 @@
                     
                     // Add to Leaderboard
                     lbData.push({ name: data.name, score: data.score || 0, isMe: false });
+                });
+
+                // CLEANUP: Remove birds that are no longer active
+                Object.keys(onlinePlayers).forEach(id => {
+                    if (!activeIds.has(id)) {
+                        scene.remove(onlinePlayers[id].mesh);
+                        delete onlinePlayers[id];
+                    }
                 });
 
                 updateLeaderboardUI(lbData);
@@ -623,13 +649,6 @@
             for (let i = 0; i < count; i++) {
                 const x = positions.getX(i);
                 // The geometry is flat initially (Z=0), but after rotation, Geo Z becomes World Y
-                // But we need to use X and Y (texture coords) to generate height
-                // Note: PlaneGeometry is X, Y. We rotate X by -90 deg. 
-                // So: Geo X -> World X. Geo Y -> World -Z.
-                
-                // Let's rely on world coordinates logic instead.
-                // We will iterate vertices, get their world X/Z equivalent, calculate Height, set Z (which becomes Y).
-                
                 const z_in_world = -positions.getY(i); 
                 const height = getTerrainHeight(x, z_in_world);
                 positions.setZ(i, Math.max(-20, height));
